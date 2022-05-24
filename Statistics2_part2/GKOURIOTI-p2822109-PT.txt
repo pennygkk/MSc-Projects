@@ -1,0 +1,242 @@
+#import packages
+library(glmnet)
+library(dplyr)
+library(corrplot)
+library(car)
+library(pscl)
+library(e1071)
+library(rpart)
+library(caret)
+library(rpart.plot)
+library(pROC)
+library(mclust)
+library(ggplot2)
+library(gridExtra)
+
+#read data
+bank <- read.csv("C:\\Users\\DELL\\Documents\\Msc R\\lab files\\projectI.csv", header=TRUE)
+str(bank)
+library(DataExplorer)
+introduce(bank) #explore missing values
+
+# remove duplicate rows of the dataframe
+bank <- bank %>% distinct()
+
+# convert to the correct data type
+bank$age <- cut(bank$age,breaks=c(16,34,64,99),labels=c('youth','middle.age','elderly'))
+bank$age <- factor(bank$age)
+bank$job <- as.factor(bank$job)
+bank$marital <- as.factor(bank$marital)
+education <- function(education){
+  if (education=='basic.4y'|education=='basic.6y'|education=='basic.9y'|education=='illiterate'){
+    return('basic')
+  }else if (education=='high.school'|education=='professional.course'){
+    return('intermediate')
+  }else if(education=='university.degree'){
+    return('advanced')
+  }else{
+    return(education)
+  }
+}
+bank$education <- sapply(bank$education,education)
+bank$education <- as.factor(bank$education)
+bank$default<- NULL #I remove it because it does not provide any vital information since only 3 observations belong to 'yes' category
+bank$housing<- as.factor(bank$housing)
+bank$loan<- as.factor(bank$loan)
+bank$contact <- as.factor(bank$contact)
+bank$month <- as.factor(bank$month)
+bank$day_of_week <- as.factor(bank$day_of_week)
+bank$poutcome <- as.factor(bank$poutcome)
+bank$pdays <- ifelse(bank$pdays==999, 0, 1)
+bank$pdays <- factor(bank$pdays,labels=c("not previously contacted","previously contacted"))
+table(bank$pdays)
+table(bank$poutcome)
+bank$pdays <- NULL #I remove it because it provides similar information with poutcome (poutcome "non existent" same with pdays "not previously contacted")
+bank$SUBSCRIBED <- ifelse(bank$SUBSCRIBED== "yes", 1, 0)
+bank$SUBSCRIBED <- factor(bank$SUBSCRIBED,labels=c('fail','success'))
+
+#correlation matrix
+social <- bank %>%
+  select(emp.var.rate, cons.price.idx, cons.conf.idx, euribor3m, nr.employed)
+cor_social <- cor(social)
+corrplot(cor_social, method = 'number', type = 'upper')
+
+###################################### Modelling ############################################
+# Logistic regression model
+full.model<- glm(SUBSCRIBED~.,bank,family=binomial)
+summary(full.model)
+
+X <- model.matrix(SUBSCRIBED ~., bank)[,-1] 
+y <- bank$SUBSCRIBED
+
+#fit lasso
+lasso1 <- cv.glmnet(X, y, alpha = 1,family=binomial)
+plot(lasso1)
+plot(lasso1$glmnet.fit, xvar = "lambda")
+abline(v=log(c(lasso1$lambda.min, lasso1$lambda.1se)), lty =2)
+coef(lasso1,s='lambda.1se',exact=TRUE)
+lasso1$lambda.min 
+lasso1$lambda.1se 
+lasso.model <- glm(SUBSCRIBED~.-housing -loan -previous -cons.price.idx -euribor3m, data = bank, family = binomial()) # model with lasso selected variables 
+summary(lasso.model) 
+#remove non statistically important variables 
+lasso.model2 <- glm(SUBSCRIBED~.-housing -loan -marital -contact -previous -cons.price.idx -cons.conf.idx -euribor3m, data = bank, family = binomial())
+summary(lasso.model2)
+
+aic.model <- step(lasso.model2, direction = "both") #model with AIC variable selection 
+summary(aic.model) 
+vif(aic.model) #remove emp.var.rate
+
+aic.model2 <- glm(SUBSCRIBED~age+job+education+month+day_of_week+duration+campaign+poutcome+nr.employed, data = bank, family = binomial())  
+summary(aic.model2)
+vif(aic.model2) #fixed
+
+# likelihood ratio test 
+with(aic.model2, null.deviance - deviance) #10020
+with(aic.model2, df.null - df.residual) #34
+with(aic.model2, pchisq(null.deviance - deviance, df.null - df.residual, lower.tail = FALSE)) #0
+logLik(aic.model2) #-7948.67 (df=35)
+
+#Pseudo R2
+p <- pR2(aic.model2)
+format(p, scientific = FALSE)
+
+
+######################################## Classification ########################################
+n <- dim(bank)[1]
+k <- 6
+set.seed(1)
+deiktes<-sample(1:n)	#random permutation of the rows
+methods <- c('logistic', 'naiveBayes','tree')
+accuracy <- matrix(data=NA, ncol= k, nrow = length(methods))
+ari <- matrix(data=NA, ncol= k, nrow = length(methods))
+
+rownames(accuracy) <- rownames(ari) <- methods
+roc1 <-list()
+# 6-fold cross validation and run logistic, decision tree and naive Bayes algorithms each time
+for (i in 1:k){
+  te <- deiktes[ ((i-1)*(n/k)+1):(i*(n/k))]	
+  train <- bank[-te, ]
+  test <- bank[te,]
+  y_test<-test$SUBSCRIBED
+  test <- bank[te,-19]
+  
+  #	logistic
+  m1 <- glm(SUBSCRIBED ~ age+job+education+month+day_of_week+duration+campaign+poutcome+nr.employed , family=binomial, data=train)
+  logpr <- predict(m1, newdata = test, type = "response")
+  rocobj <- roc(y_test, logpr)
+  roc1[[i]] <- ggroc(rocobj)
+  logpr <- ifelse(logpr > 0.2,'success','fail')
+  accuracy['logistic',i] <- sum(bank[te,]$SUBSCRIBED == logpr)/dim(test)[1]
+  ari['logistic',i] <- adjustedRandIndex(logpr, bank[te,]$SUBSCRIBED)
+  
+  #	decision tree
+  m2 <- rpart(SUBSCRIBED ~., data = train, method = 'class')
+  treepr <- predict(m2,newdata=test)
+  treepr <- ifelse(treepr[,'success'] > 0.2,'success','fail')
+  accuracy['tree',i] <- sum(bank[te,]$SUBSCRIBED == treepr)/dim(test)[1]
+  ari['tree',i] <- adjustedRandIndex(treepr, bank[te,]$SUBSCRIBED)
+  
+  #	naive Bayes
+  m3 <-naiveBayes(SUBSCRIBED ~.-euribor3m, data = train)
+  naivepr <- predict(m3, test)
+  accuracy['naiveBayes',i] <- sum(bank[te,]$SUBSCRIBED == naivepr)/dim(test)[1]
+  ari['naiveBayes',i] <- adjustedRandIndex(naivepr, bank[te,]$SUBSCRIBED)
+  
+  con1 <-confusionMatrix(factor(logpr), factor(y_test), mode='everything' , positive='success')
+  con2 <-confusionMatrix(factor(treepr), factor(y_test), mode='everything' , positive='success')
+  con3 <-confusionMatrix(factor(naivepr), factor(y_test), mode='everything' , positive='success')
+    
+}
+#ROC curves for each fold for logistic regression
+grid.arrange(roc1[[1]],roc1[[2]],roc1[[3]],roc1[[4]],roc1[[5]],roc1[[6]], nrow = 2)
+
+#boxplots of accuracy for each classification method
+boxplot(t(accuracy), ylab='predictive accuracy', xlab='method')
+
+#print confusion matrix results for each classification method
+print(con1) #logistic
+print(con2) #tree
+print(con3) #naive
+
+#plot decision tree
+rpart.plot(m2,cex=0.8)
+
+#comparison of metrics for each classification method
+t <- as.data.frame(ari)
+tab_df(t, show.rownames = TRUE)
+
+a <- as.data.frame(accuracy)
+tab_df(a, show.rownames = TRUE)
+
+####################################### Clustering #############################################
+
+library(cluster) 
+library(Rtsne)
+
+#read the file again
+bank_s <- read.csv("C:\\Users\\DELL\\Documents\\Msc R\\lab files\\projectI.csv", header=TRUE)
+
+#I take a small sample of 10000 obs because my laptop's memory is not enough to store more data
+bank_s <- sample_n(bank_s, 10000)
+bank_s <- bank_s[,-c(8:11,16:21)]
+
+#data cleaning
+str(bank_s)
+bank_s$age <- as.factor(bank_s$age)
+bank_s$job <- as.factor(bank_s$job)
+bank_s$marital <- as.factor(bank_s$marital)
+bank_s$education <- as.factor(bank_s$education)
+bank_s$default <- as.factor(bank_s$default)
+bank_s$housing <- as.factor(bank_s$housing)
+bank_s$loan <- as.factor(bank_s$loan)
+bank_s$campaign <- as.factor(bank_s$campaign)
+bank_s$pdays <- ifelse(bank_s$pdays==999, 0, 1)
+bank_s$pdays <- factor(bank_s$pdays,labels=c("not previously contacted","previously contacted"))
+bank_s$poutcome <- as.factor(bank_s$poutcome)
+
+#calculate Gower distance
+gower_dist <- daisy(bank_s,
+                    metric = "gower")
+
+#calculate silhouette width using PAM
+
+sil_width <- c(NA)
+for(i in 2:10){
+  
+  pam_fit <- pam(gower_dist,
+                 diss = TRUE,
+                 k = i)
+  
+  sil_width[i] <- pam_fit$silinfo$avg.width
+  
+}
+
+#plot sihouette width
+plot(1:10, sil_width,
+     xlab = "Number of clusters",
+     ylab = "Silhouette Width")
+lines(1:10, sil_width)  #highest value is at 2 clusters
+
+#run PAM with 2 clusters
+pam_fit <- pam(gower_dist, diss = TRUE, k = 2)
+
+#summary for each cluster
+pam_results <- bank_s %>%
+  
+  mutate(cluster = pam_fit$clustering) %>%
+  group_by(cluster) %>%
+  do(the_summary = summary(.))
+
+pam_results$the_summary
+
+#visualization of clusters
+tsne_obj <- Rtsne(gower_dist, is_distance = TRUE)
+
+tsne_data <- tsne_obj$Y %>%
+  data.frame() %>%
+  setNames(c("X", "Y")) %>%
+  mutate(cluster = factor(pam_fit$clustering)
+  )
+ggplot(aes(x = X, y = Y), data = tsne_data) +
+  geom_point(aes(color = cluster))
