@@ -1,0 +1,25 @@
+
+
+LOAD CSV WITH HEADERS FROM "file:///airports.csv" AS line
+WITH line WHERE line.AirportID IS NOT NULL
+CREATE (:Airport {airportId: toInteger(line.AirportID), name: line.Name, city: line.City, country: line.Country, Iata: line.IATA, Icao: line.ICAO, latitude: line.Latitude, longitude: line.Longitude});
+
+LOAD CSV WITH HEADERS FROM "file:///airlines.csv" AS line
+WITH line WHERE line.AirlineID IS NOT NULL
+CREATE (:Airline {airlineID: toInteger(line.AirlineID), name: line.Name, Ιata: line.IATA, Ιcao: line.ICAO, country: line.Country, active: line.Active });
+
+LOAD CSV WITH HEADERS FROM "file:///routes.csv" AS line
+CREATE (:Route {airline: line.Airline, airlineId: toInteger(line.AirlineID), source: line.Source, sourceId: toInteger(line.SourceID), destination: line.Destination, destinationId: toInteger(line.DestinationID), stops: line.Stops, equipment: line.Equipment });
+
+MATCH (a:Airport),(r:Route)
+WHERE a.airportId = r.sourceId
+CREATE (a)-[:Departs_from]->(r);
+
+MATCH (a:Airport),(r:Route)
+WHERE a.airportId = r.destinationId
+CREATE (r)-[:Arrives_to]->(a);
+
+MATCH (b:Airline),(r:Route)
+WHERE b.airlineID = r.airlineId
+CREATE (r)-[:Performed_by]->(b);
+
